@@ -3,6 +3,8 @@ import Security
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
 #endif
 
 extension View {
@@ -12,8 +14,9 @@ extension View {
     ///         .usageReporting(app: "pinpoint")
     ///
     /// Each report says only whether it's also the install's first of the week and of the month, plus the app
-    /// version, platform, device model, system version and language. While the app is on screen it also sends a
-    /// heartbeat each minute, holding only the app's name, for sessions, time spent and people using it now.
+    /// version, platform, device model, system version and language. While the app is active it also sends a
+    /// heartbeat each minute, holding only the app's name, for sessions, time spent and people using it now. The
+    /// heartbeats follow the app's active state, so they continue while a full-screen player covers this view.
     /// Debug builds don't report unless launched with `-PSFUsageDebug YES`. People turn it off with
     /// `UsageReporting.isEnabled`.
     public func usageReporting(app: String, isEnabled: Bool = true) -> some View {
@@ -48,30 +51,92 @@ public enum UsageReporting {
     }
 
     /// How often an app on screen says so. The server counts heartbeats this recent as people using it now.
-    static let heartbeatInterval: Duration = .seconds(60)
+    static let heartbeatInterval: TimeInterval = 60
     /// Coming back on screen within this long continues the session, so a quick trip to another app isn't a new one.
     static let sessionGap: TimeInterval = 5 * 60
-    @MainActor static var lastOnScreen: Date?
-    @MainActor private static var isBeating = false
 
-    /// Sends a heartbeat when the app comes on screen and every minute until it leaves. Each adds a minute of
-    /// foreground time, and the first after a break also starts a session. Only the app's name is sent.
-    @MainActor static func sendHeartbeats(app: String) async {
-        // One loop for the app, even with several windows on screen.
-        guard mayReport, !isBeating else { return }
-        isBeating = true
-        defer { isBeating = false }
-        var start = lastOnScreen.map { Date.now.timeIntervalSince($0) > sessionGap } ?? true
+    /// Whether the next heartbeat starts a session, given when the app was last on screen.
+    static func startsSession(lastOnScreen: Date?, now: Date) -> Bool {
+        lastOnScreen.map { now.timeIntervalSince($0) > sessionGap } ?? true
+    }
+
+    /// How long to wait before the next heartbeat. Coming back on screen within a minute of the last one waits out
+    /// the rest of that minute, so a quick trip to Control Center doesn't add a minute.
+    static func heartbeatDelay(lastHeartbeat: Date?, now: Date) -> TimeInterval {
+        guard let lastHeartbeat else { return 0 }
+        return min(max(0, heartbeatInterval - now.timeIntervalSince(lastHeartbeat)), heartbeatInterval)
+    }
+}
+
+/// Sends a heartbeat each minute while the app is active, and the daily report when it becomes active.
+///
+/// Follows the app's own active state rather than a view's lifetime: a view's tasks are cancelled when something
+/// covers it, such as a full-screen video player presented over the root view, which stopped the heartbeats for
+/// as long as the video played.
+@MainActor final class UsageMonitor {
+    static let shared = UsageMonitor()
+
+    private var app: String?
+    private var heartbeats: Task<Void, Never>?
+    private var observers: [NSObjectProtocol] = []
+    private var lastOnScreen: Date?
+    private var lastHeartbeat: Date?
+
+    /// Starts following the app's active state. Later calls do nothing, even from several windows.
+    func start(app: String) {
+        guard self.app == nil else { return }
+        self.app = app
+        let center = NotificationCenter.default
+        observers = [
+            center.addObserver(forName: Self.didBecomeActive, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { UsageMonitor.shared.becameActive() }
+            },
+            center.addObserver(forName: Self.willResignActive, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { UsageMonitor.shared.resignedActive() }
+            },
+        ]
+        if Self.isActive { becameActive() }
+    }
+
+    private func becameActive() {
+        guard let app, heartbeats == nil else { return }
+        Task { await UsageReporting.reportIfNeeded(app: app) }
+        heartbeats = Task { await beat(app: app) }
+    }
+
+    private func resignedActive() {
+        heartbeats?.cancel()
+        heartbeats = nil
+        if lastHeartbeat != nil { lastOnScreen = .now }
+    }
+
+    private func beat(app: String) async {
+        guard UsageReporting.mayReport else { return }
+        let delay = UsageReporting.heartbeatDelay(lastHeartbeat: lastHeartbeat, now: .now)
+        if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
+        var start = UsageReporting.startsSession(lastOnScreen: lastOnScreen, now: .now)
         while !Task.isCancelled {
+            lastHeartbeat = .now
             lastOnScreen = .now
             let body: [String: any Sendable] = ["app": app, "start": start]
             Task.detached { _ = await API.post("v1/heartbeat", body) }
             start = false
-            try? await Task.sleep(for: heartbeatInterval)
+            try? await Task.sleep(for: .seconds(UsageReporting.heartbeatInterval))
         }
-        lastOnScreen = .now
     }
 
+    #if os(macOS)
+    private static let didBecomeActive = NSApplication.didBecomeActiveNotification
+    private static let willResignActive = NSApplication.willResignActiveNotification
+    private static var isActive: Bool { NSApplication.shared.isActive }
+    #else
+    private static let didBecomeActive = UIApplication.didBecomeActiveNotification
+    private static let willResignActive = UIApplication.willResignActiveNotification
+    private static var isActive: Bool { UIApplication.shared.applicationState == .active }
+    #endif
+}
+
+extension UsageReporting {
     /// The periods a report sent at `date` would be the first of, in UTC to match the server's days.
     struct Periods: Equatable, Codable {
         var day: String
@@ -163,20 +228,14 @@ enum LastReport {
 struct UsageModifier: ViewModifier {
     let app: String
     let isEnabled: Bool
-    @Environment(\.scenePhase) private var scenePhase
 
     func body(content: Content) -> some View {
-        content
-            // Apps stay open for days, so a new day's activation counts too, not just launch.
-            .task(id: scenePhase) {
-                guard isEnabled, scenePhase == .active else { return }
-                await UsageReporting.reportIfNeeded(app: app)
-            }
-            // Cancelled when the app leaves the screen, which ends the heartbeats.
-            .task(id: scenePhase) {
-                guard isEnabled, scenePhase == .active else { return }
-                await UsageReporting.sendHeartbeats(app: app)
-            }
+        // Heartbeats and the daily report follow the app's active state, not this view: apps stay open for days,
+        // and a full-screen player over the root view would otherwise stop them.
+        content.task {
+            guard isEnabled else { return }
+            UsageMonitor.shared.start(app: app)
+        }
     }
 }
 

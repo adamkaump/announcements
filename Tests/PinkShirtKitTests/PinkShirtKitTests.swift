@@ -108,3 +108,21 @@ import Testing
     }
 
 }
+
+@Suite struct HeartbeatTests {
+    let now = Date(timeIntervalSince1970: 1_000_000)
+
+    @Test func sessions() {
+        #expect(UsageReporting.startsSession(lastOnScreen: nil, now: now))
+        #expect(!UsageReporting.startsSession(lastOnScreen: now.addingTimeInterval(-120), now: now))
+        #expect(UsageReporting.startsSession(lastOnScreen: now.addingTimeInterval(-301), now: now))
+    }
+
+    @Test func delay() {
+        #expect(UsageReporting.heartbeatDelay(lastHeartbeat: nil, now: now) == 0)
+        #expect(UsageReporting.heartbeatDelay(lastHeartbeat: now.addingTimeInterval(-20), now: now) == 40)
+        #expect(UsageReporting.heartbeatDelay(lastHeartbeat: now.addingTimeInterval(-90), now: now) == 0)
+        // A clock that moved backwards never waits more than one interval.
+        #expect(UsageReporting.heartbeatDelay(lastHeartbeat: now.addingTimeInterval(30), now: now) == 60)
+    }
+}
